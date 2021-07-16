@@ -1,11 +1,13 @@
 import {
   IntegrationError,
   IntegrationLogger,
-} from "@jupiterone/jupiter-managed-integration-sdk";
+  IntegrationProviderAPIError,
+} from '@jupiterone/integration-sdk-core';
 
-import { IntegrationConfig } from "./types";
+import { IntegrationConfig } from './config';
 
-import * as request from "request-promise-native";
+import { retry } from '@lifeomic/attempt';
+import fetch from 'node-fetch';
 
 export interface Account {
   name: string;
@@ -25,7 +27,7 @@ export interface RiskScore {
 }
 
 export interface UserBase {
-  id: number;
+  id: string;
   first_name: string;
   last_name: string;
   email: string;
@@ -44,7 +46,7 @@ export interface User extends UserBase {
   manager_email: string | null;
   adi_manageable: boolean | null;
   adi_guid: string | null;
-  groups: number[];
+  groups: string[];
   aliases: string[] | null;
   joined_on: string | null;
   last_sign_in: string | null;
@@ -58,7 +60,7 @@ export interface User extends UserBase {
 }
 
 export interface GroupBase {
-  id: number;
+  id: string;
   group_id?: number;
   name: string;
 }
@@ -135,8 +137,8 @@ export default class ProviderClient {
     this.logger = logger;
     this.options = {
       headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
         Authorization: `Bearer ${config.apiKey}`,
       },
     };
@@ -144,33 +146,37 @@ export default class ProviderClient {
 
   public async fetchAccountDetails(): Promise<Account> {
     try {
-      this.logger.trace("Fetching KnowBe4 account...");
-      const result = await this.collectOnePage("account");
-      this.logger.trace({}, "Fetched KnowBe4 account");
-      return JSON.parse(result);
+      this.logger.trace('Fetching KnowBe4 account...');
+      const result = await this.collectOnePage('account');
+      this.logger.trace({}, 'Fetched KnowBe4 account');
+      return await result.json();
     } catch (err) {
       throw new IntegrationError({
         cause: err,
-        expose: false,
-        message: "Error calling KnowBe4 API",
+        code: 'fail',
+        message: 'Error calling KnowBe4 API',
       });
     }
   }
 
   public async fetchGroups(): Promise<Group[]> {
-    return await this.collectAllPages("groups");
+    return await this.collectAllPages('groups');
   }
 
   public async fetchUsers(): Promise<User[]> {
-    return await this.collectAllPages("users");
+    return await this.collectAllPages('users');
   }
 
   public async fetchTraining(): Promise<TrainingCampaign[]> {
-    return await this.collectAllPages("training/campaigns");
+    return await this.collectAllPages('training/campaigns');
   }
 
   public async fetchTrainingEnrollments(): Promise<TrainingEnrollment[]> {
-    return await this.collectAllPages("training/enrollments");
+    return await this.collectAllPages('training/enrollments');
+  }
+
+  public getBaseApi(): string {
+    return this.BASE_API_URL;
   }
 
   private async forEachPage(
@@ -187,8 +193,8 @@ export default class ProviderClient {
     let more = true;
 
     while (more) {
-      const response = await request.get(nextPageUrl, this.options);
-      const page = JSON.parse(response);
+      const response = await this.fetchWithBackoff(nextPageUrl, this.options);
+      const page = await response.json();
       more = page && page.length && page.length > 0;
       if (more) {
         eachFn(page);
@@ -219,8 +225,8 @@ export default class ProviderClient {
     } catch (err) {
       throw new IntegrationError({
         cause: err,
-        expose: false,
-        message: "Error calling KnowBe4 API",
+        code: 'fail',
+        message: 'Error calling KnowBe4 API',
       });
     }
   }
@@ -229,6 +235,37 @@ export default class ProviderClient {
     const url = params
       ? `${this.BASE_API_URL}/${path}?${params}`
       : `${this.BASE_API_URL}/${path}`;
-    return await request.get(url, this.options);
+    return await this.fetchWithBackoff(url, this.options);
+  }
+
+  private async fetchWithBackoff(url, fetchOptions) {
+    //KnowBe4 API rate limits to 4/sec and 1000/day
+    const retryOptions = {
+      delay: 250,
+      maxAttempts: 8,
+      initialDelay: 0,
+      minDelay: 0,
+      maxDelay: 0,
+      factor: 2,
+      timeout: 0,
+      jitter: false,
+      handleError: null,
+      handleTimeout: null,
+      beforeAttempt: null,
+      calculateDelay: null,
+    }; // 8 attempts with 250 ms start and factor 2 means longest wait is 32 seconds
+    return await retry(async () => {
+      const reply = await fetch(url, fetchOptions);
+      this.logger.warn(`Rate limiting encountered. Waiting and trying again.`);
+      if (reply.status === 429) {
+        throw new IntegrationProviderAPIError({
+          cause: undefined,
+          endpoint: url,
+          status: reply.status,
+          statusText: `Failure requesting '${url}' due to rate-limiting.`,
+        });
+      }
+      return reply;
+    }, retryOptions);
   }
 }
